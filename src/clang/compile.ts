@@ -23,11 +23,13 @@ export class CODALCompiler implements Compiler {
             case "error":   
                 console.error(`[CODAL] Error: ${msg.body}`);   
                 this.errorFlag = true;
+                this.stderr = String(msg.body || "CODAL compilation failed.");
+                this.compiling = false;
                 break;
             case "stderr":  
                 console.error(`[CODAL] ${msg.source} error\nstderr: ${msg.body}`);
                 this.errorFlag = true;
-                this.stderr = msg.body;  
+                this.stderr = String(msg.body || `${msg.source || "Compiler"} reported an error.`);
                 break;
             case "compile-complete":
                 console.log("[CODAL] Compile complete.");
@@ -45,6 +47,8 @@ export class CODALCompiler implements Compiler {
     async compile(files : Record<string, Uint8Array>) : Promise<void> {
         this.compiling = true;
         this.errorFlag = false; //clear error flag before compile
+        this.stderr = "";
+        this.hex = new Uint8Array();
 
         this.worker.postMessage({
             type: "compile",
