@@ -1,5 +1,5 @@
 import { HStack, Progress, Stack, Spinner, Text } from "@chakra-ui/react";
-import { onLoaded, onProgress } from "../clang/clang";
+import { onLoaded, onLoadError, onProgress } from "../clang/clang";
 import { useEffect, useState } from "react";
 import useActionFeedback from "../common/use-action-feedback";
 
@@ -12,6 +12,7 @@ export const LoadProgressBar = ({ setLoaded }: LoadProgressBarProps) => {
 
   const [progress, setProgress] = useState(0);
   const [progressText, setProgressText] = useState("Loading...");
+  const [loadError, setLoadError] = useState("");
 
   const progressCallback = (progress: number, msg?: string) => {
     if (progress < 0 || progress > 1) return;
@@ -29,11 +30,13 @@ export const LoadProgressBar = ({ setLoaded }: LoadProgressBarProps) => {
     onProgress(progressCallback);
     onLoaded(() => {
       setLoaded(true);
+      setLoadError("");
       actionFeedback.success({
         title: "Setup Complete!",
         description: "Ready to send hex to micro:bit",
       });
     });
+    onLoadError((message) => setLoadError(message));
     return () => {};
   }, [actionFeedback, setLoaded]);
 
@@ -41,8 +44,10 @@ export const LoadProgressBar = ({ setLoaded }: LoadProgressBarProps) => {
     <Stack flex="1" direction="column" justifyContent="center" gap={1}>
       <HStack justifyContent="space-between" px={2}>
         <HStack alignItems="center">
-          <Spinner size="sm" />
-          <Text fontWeight="bold">{progressText}</Text>
+          {loadError ? undefined : <Spinner size="sm" />}
+          <Text fontWeight="bold" color={loadError ? "red.600" : undefined}>
+            {loadError ? `Compiler setup failed: ${loadError}` : progressText}
+          </Text>
         </HStack>
         <Text fontWeight="bold">{progress.toFixed(0)}%</Text>
       </HStack>
