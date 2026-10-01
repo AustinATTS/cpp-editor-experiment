@@ -1,7 +1,7 @@
 import { BoardId } from "../device/board-id";
 import { FlashDataSource, HexGenerationError } from "../device/device";
 
-import { clang, Clang } from "../clang/clang";
+import { clang, Clang, waitForCompiler } from "../clang/clang";
 import { FileSystem } from "./fs";
 
 export interface HexGenerator extends FlashDataSource {
@@ -17,6 +17,7 @@ export class ClangHexGenerator implements HexGenerator {
 
     private async flashData(): Promise<Uint8Array> {
         try {
+            await waitForCompiler();
             await this.clang.compiler.compile(await this.files());
             const hex = await this.clang.compiler.getHex();
             return hex;
@@ -42,11 +43,13 @@ export class ClangHexGenerator implements HexGenerator {
     }
 
     async toHexForSave(): Promise<string> {
-        //const fs = await this.initialize();
-      
         try {
-          let hex = await this.toHexString(await this.flashData());
-          let ihex = await this.hex2ascii(hex);
+            // llvm-objcopy writes an ASCII Intel HEX file. Decode those bytes as
+            // text directly instead of round-tripping them through hex strings.
+            const ihex = new TextDecoder("ascii").decode(await this.flashData());
+            if (!ihex.startsWith(":")) {
+                throw new Error("The CODAL compiler output is not an Intel HEX file.");
+            }
           return ihex;
         } catch (e: any) {
           throw new HexGenerationError(e.message);
