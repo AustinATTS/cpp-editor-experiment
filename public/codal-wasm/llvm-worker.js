@@ -63,7 +63,13 @@ class LLVM {
     initialised = false;
 
     constructor(){
-        this.init();
+        this.init().catch((error) => {
+            postMessage({
+                target: "worker",
+                type: "error",
+                body: `CODAL toolchain initialization failed: ${error?.message || error}`,
+            });
+        });
     }
 
     fileSystem = null;
@@ -78,7 +84,36 @@ class LLVM {
                     weight: 95,
                     fn: async (progressCallback)=>{
                         this.fileSystem = await new FileSystem();
-                        await this.fileSystem.unpack(progressCallback, "./root.tar.xz"); 
+                        await this.fileSystem.unpack(progressCallback, "./root.tar.xz");
+                        const linkerScriptPath = "/libraries/codal-microbit-v2/ld/nrf52833-softdevice.ld";
+                        let linkerScript = this.fileSystem.readFile(linkerScriptPath, { encoding: "utf8" });
+                        const oldBssEnd = `        __bss_end__ = .;
+                    } > RAM`;
+                    const fixedBssEnd = `        __bss_end__ = .;
+                    __HeapBase = ALIGN(., 8);
+                    __end__ = __HeapBase;
+                    end = __end__;
+                    . = 0x2001f800;
+                    __HeapLimit = .;
+                    . = 0x20020000;
+                    __StackTop = .;
+                } > RAM`;
+                const oldHeapBlock = `    .heap (NOLOAD):
+                {
+                    __end__ = .;
+                    end = __end__;
+                    *(.heap*);
+                    ASSERT(. <= (ORIGIN(RAM) + LENGTH(RAM) - 0x800), "heap region overflowed into stack");
+                    . += (ORIGIN(RAM) + LENGTH(RAM) - 0x800) - .;
+                } > RAM
+                __StackTop = ORIGIN(RAM) + LENGTH(RAM);
+                PROVIDE(__stack = __StackTop);`;
+                const fixedHeapBlock = `    PROVIDE(__stack = __StackTop);`;
+                if (!linkerScript.includes(oldBssEnd) || !linkerScript.includes(oldHeapBlock)) {
+                    throw new Error("The CODAL linker script has an unexpected .heap section; refusing to build with invalid RAM symbols.");
+                }
+                linkerScript = linkerScript.replace(oldBssEnd, fixedBssEnd).replace(oldHeapBlock, fixedHeapBlock);
+                this.fileSystem.writeFile(linkerScriptPath, linkerScript);
                     }
                 },
                 {
@@ -93,7 +128,7 @@ class LLVM {
                     weight: 2,
                     fn: async ()=>{
                         const processConfig = {FS: this.fileSystem.FS};
-                
+
                         const tools = {
                             "llvm-box": new LlvmBoxProcess(processConfig),
                             "clangd": new ClangdProcess({
@@ -102,7 +137,7 @@ class LLVM {
                             })
                         };
                         this.tools = tools;
-                
+
                         for (let tool in tools) {
                             await tools[tool];
                             this.fileSystem.delete("/wasm/"+tool+".wasm");
@@ -126,12 +161,7 @@ class LLVM {
                 },
             ],
             progressCallback,
-            () => {
-                postMessage({
-                    target: "worker",
-                    type: "progress/done",
-                })
-            }
+            () => {}
         )
 
         await initProcesses.run();
@@ -141,7 +171,11 @@ class LLVM {
         llvm.run('clangd');
     
         this.initialised = true;
-        onInit();  
+        onInit();
+        postMessage({
+            target: "worker",
+            type: "progress/done",
+        });
     };
 
     onprocessstart = () => {};
@@ -271,7 +305,14 @@ async function compileCode(fileArray) {
         body: linkOutput,
     })
 
-    if (isError(linkOutput.stderr)) { 
+    postMessage({
+        target: "compile",
+        type: "output",
+        source: "linker",
+        body: linkOutput,
+    })
+
+    if (linkOutput.returncode !== 0 || isError(linkOutput.stderr)) {
         postMessage({
             target: "compile",
             type: "stderr",
@@ -280,6 +321,22 @@ async function compileCode(fileArray) {
         });
         
         return false;
+    }
+
+    // Catch bad RAM layout before emitting a HEX that predictably panics on-device.
+    const mapText = llvm.fileSystem.readFile('/working/MICROBIT.map', {
+        encoding: 'utf8'
+    });
+    const symbolAddress = (symbol) => {
+        const line = mapText.split(/\r?\n/).find(entry => entry.trim().endsWith(symbol) || entry.includes(` ${symbol} =`));
+        const match = line && /^\s*([0-9a-fA-F]+)\s+/.exec(line);
+        return match ? Number.parseInt(match[1], 16) : null;
+    };
+    const heapBase = symbolAddress('__HeapBase');
+    const heapLimit = symbolAddress('__HeapLimit');
+    const stackTop = symbolAddress('__StackTop');
+    if (heapBase === null || heapLimit !== 0x2001f800 || stackTop !== 0x20020000 || heapBase < 0x20002040 || heapBase > heapLimit) {
+        throw new Error(`Invalid nRF52833 RAM layout (heap base ${heapBase === null ? 'missing' : `0x${heapBase.toString(16)}`}, heap limit ${heapLimit === null ? 'missing' : `0x${heapLimit.toString(16)}`}, stack top ${stackTop === null ? 'missing' : `0x${stackTop.toString(16)}`}).`);
     }
 
     //Converting MICROBIT executable to hex file. Using llvm-objcopy.wasm module.
@@ -365,30 +422,36 @@ onmessage = async(e) => {
 async function handleCompileRequest(files) {
     if (!llvm.initialised) {
         postMessage({
-            target: "worker",
+            target: "compile",
             type: "error",
             body: "Cannot compile yet, worker is not yet initialised"
         })
+        postMessage({ target: "compile", type: "compile-complete" });
         return;
     }
 
-    llvm.saveFiles(files);
-        
-    let success = await compileCode(Object.keys(files))
-    
-    if (success) {
-        const hex = await llvm.getHex();
-        postMessage({
-            target: "compile",
-            type: "hex",
-            body: hex,
-        });
-    } else {
+    try {
+        await llvm.saveFiles(files);
+        const success = await compileCode(Object.keys(files))
+        if (success) {
+            const hex = await llvm.getHex();
+            if (!hex.length) {
+                throw new Error("The compiler produced an empty HEX image.");
+            }
+            postMessage({
+                target: "compile",
+                type: "hex",
+                body: hex,
+            });
+        } else {
+            throw new Error("Compilation failed; see the compiler output for details.");
+        }
+    } catch (error) {
         postMessage({
             target: "compile",
             type: "error",
-            body: "Compilation failed",
-        })
+            body: error?.message || String(error),
+        });
     }
 
     postMessage({
@@ -396,7 +459,11 @@ async function handleCompileRequest(files) {
         type: "compile-complete",
     })
 
-    await clean();
+    try {
+        await clean();
+    } catch (error) {
+        console.warn("Could not clean compiler temporary files:", error);
+    }
 }
 
 const lspUtil = new LSPUtil();
